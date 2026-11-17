@@ -1,0 +1,48 @@
+Build a month-end payments reconciliation tool for a 2-hour timed assessment. Keep it simple; do not add features I haven't listed. Python 3.11+, pytest, Streamlit. Build and test in this order: generator, reconciler, tests, app. Run the tests after each stage and fix failures honestly.
+
+PROBLEM
+A payments platform records transactions instantly; the bank settles 1-2 calendar days later. At month end the platform and bank totals don't match. Generate our own data with four planted gap types, detect each gap, explain it in plain language, and show a bridge: platform total - bank total = timing + rounding + duplicate + orphan refund + unexplained remainder.
+
+ASSUMPTIONS (put these in the README and on the app page)
+- Period: October 2026, IST. Platform date = txn_timestamp date as written (+05:30); bank gives settlement date only.
+- Comparison basis: platform total = rows with an IST date in October; bank total = rows with a settlement date in October. Bank file runs to 3 Nov so November settlements are visible.
+- Match key: txn_id = reference. Single currency INR, gross amounts, no fees, only successful transactions, no prior-month carryover.
+- Settlement lag: 1 or 2 calendar days.
+- Refunds: separate rows, negative amounts, with original_txn_id (platform) / original_reference (bank).
+- Platform amounts have 3 decimals; bank amounts 2 decimals.
+- All amounts are Decimal. NEVER use float anywhere; read CSVs as strings; hold generator amounts as integer thousandths.
+
+generate_data.py (random.Random(2026); only randint/choice/sample; sample from sorted lists)
+1. 500 sales: 496 random (Oct date/time, 50.00-5000.00) plus 4 forced: one at 1 Oct 00:07, one at 31 Oct 23:58, and two decoys, different transactions on the same day with the same amount 1250.00. Sort by time; ids TXN-000001...
+2. Lag 1 or 2 days per sale.
+3. Pick, removing each pick from the pool and excluding the 4 forced/decoy rows from every pool: 20 refunds (originals from sales dated 1-26 Oct; full negative amount; dated 1-4 days after the original, except RFD-0020 which is forced to 31 Oct 22:15; own lag 1-2), 1 duplicate sale (dated 1-28 Oct), 60 rounding sales (dated 1-28 Oct). Rounding sales get platform amount = base + 0.005 (third decimal 5); the bank amount is the base amount.
+4. Platform rows = sales + refunds + one exact extra copy of the duplicate (same txn_id, different record_id: REC-000001...). Bank rows = each sale once (2dp), each valid refund once (negative, with original_reference), plus a bank-only orphan RFD-0021 of -1499.00 on 14 Oct with original_reference TXN-900001. The duplicate's extra row is not in the bank. Ids STL-000001..., sorted by settlement date then reference.
+5. Build ground_truth.csv from the construction records (not by comparing files): gap_type (TIMING, ROUNDING, DUPLICATE, ORPHAN_REFUND), txn_id, amount, bridge_effect (contribution to platform minus bank on the October basis), note. TIMING = every row dated in October that settles in November, sales and refunds.
+6. expected_totals.json: period, currency, platform_total_oct, bank_total_oct, difference, bank_window_end (Decimal strings).
+7. Assert BEFORE writing any file: exact counts (500 sales, 20 refunds, 60 rounding, 1 duplicate, 1 orphan); all platform dates in October; rounding lines dated 1-28 Oct with a third decimal of 5, summing exactly to 0.300 of difference, none a refunded original, the duplicate or a forced/decoy row; no refund original, duplicate or rounding pick is a forced/decoy row; every other platform amount ends in 0 and equals its bank amount; exactly one repeated txn_id on the platform and no repeated bank reference; every refund's original is an earlier platform SALE with the exact negated amount; the orphan's original is not in platform.csv and is not any valid refund's original, and its settlement date is in October; at least one timing sale and one timing refund; all lags 1 or 2; no bank date after 3 Nov; sum of bridge_effect equals the independently computed difference; amount strings match 3dp (platform) and 2dp (bank).
+
+reconcile.py (pure functions; NEVER read ground_truth.csv or expected_totals.json; period and window end are constants)
+1. Detect duplicates first in both datasets; dedupe for matching only (the totals still use all rows). Extra platform row: effect +amount; extra bank row: effect -amount.
+2. Match deduped platform to deduped bank on txn_id = reference.
+3. For each October platform row: exact; ROUNDING if the difference is nonzero and <= 0.005 (effect = difference); AMOUNT_MISMATCH if larger (unexplained); TIMING if the bank row is dated in November (effect = platform amount); MISSING_IN_BANK if no bank row (unexplained).
+4. Unmatched October bank rows: ORPHAN_REFUND if a refund whose original_reference is not a platform SALE id (effect = -bank amount), else unexplained bank-only.
+5. Check every refund on both sides: original_txn_id / original_reference must exist as a platform SALE; otherwise flag as an orphan (effect = its contribution to the totals).
+6. Bridge: totals computed independently from the rows. Explained = timing + rounding + duplicate + orphan. Remainder = difference - explained. Separately compare the remainder with the sum of the unexplained rows' effects and show "bridge integrity error" if they differ.
+7. Each gap has a plain-language reason.
+8. Each row must belong to at most one gap, so the orphan refund is flagged once and never counted twice in the bridge.
+
+app.py (Streamlit): read data/ files; show platform total, bank total and difference; the bridge table with a red remainder if non-zero; a gaps-by-type table (count, total effect); a detail table filterable by type (type, txn_id, amount, effect, reason); a rounding section listing the 60 lines and their total; the assumptions. Commit data/ so it deploys on Streamlit Community Cloud.
+
+tests/ (pytest):
+- Generator determinism, counts and self-checks.
+- Detected non-exact gaps equal ground_truth.csv on (type, txn_id, effect), with no extras.
+- 60 rounding lines total exactly 0.300.
+- Bridge matches expected_totals.json and the remainder is 0.
+- Exactly one duplicate is flagged and the decoys are not.
+- The 1 Oct 00:07 sale is October and not timing; the 31 Oct 23:58 sale is in the platform total and flagged TIMING.
+- Tolerance edge: difference 0.005 is ROUNDING, 0.006 is AMOUNT_MISMATCH.
+- Unplanted anomalies: add 10.00 to one ordinary platform amount and delete one ordinary bank row; both are flagged, the remainder equals 10.00 plus the deleted row's platform amount, and the integrity check passes.
+- Clean data: a small matching dataset gives zero gaps and a remainder of 0.
+- The reconcile.py source contains neither "ground_truth" nor "expected_totals".
+
+Also provide README.md (assumptions, how to run, how to test, and 3 sentences on what would go wrong in production) and requirements.txt.
